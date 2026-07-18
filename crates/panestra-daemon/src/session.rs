@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::HashMap,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -15,6 +15,8 @@ use parking_lot::{Mutex, RwLock};
 #[cfg(not(target_os = "macos"))]
 use portable_pty::ChildKiller;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+#[cfg(target_os = "macos")]
+use std::collections::{HashSet, VecDeque};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tokio::sync::broadcast;
@@ -1612,8 +1614,9 @@ mod tests {
             .parse()
             .unwrap();
         let handle = manager.get(session.id).unwrap();
-        assert!(handle.root_process.is_some());
+        #[cfg(target_os = "macos")]
         {
+            assert!(handle.root_process.is_some());
             let mut tracked = handle.managed_processes.lock();
             handle.refresh_managed_processes(&mut tracked).unwrap();
             assert!(
