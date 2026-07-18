@@ -28,8 +28,10 @@ jobs:
       - name: Install toolchain
         uses: jdx/mise-action@v4
 
-      - name: Enable Corepack
-        run: corepack enable
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          cache: true
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
