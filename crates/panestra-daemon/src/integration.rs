@@ -47,7 +47,7 @@ impl IntegrationManager {
     #[cfg(test)]
     pub fn for_tests() -> Self {
         Self {
-            base_url: "http://127.0.0.1:4317".into(),
+            base_url: "http://127.0.0.1:8371".into(),
             hook_executable: "/tmp/panestra-daemon".into(),
             credentials: Arc::default(),
         }

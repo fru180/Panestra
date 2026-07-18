@@ -4,11 +4,12 @@ import solid from "vite-plugin-solid";
 export default defineConfig({
   plugins: [solid()],
   server: {
-    port: 5173,
+    port: 8372,
     strictPort: true,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:4317",
+        target: "http://127.0.0.1:8371",
+        changeOrigin: true,
         ws: true,
       },
     },

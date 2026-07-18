@@ -54,7 +54,7 @@ Start the web app and daemon in development mode:
 mise run dev
 ```
 
-The daemon listens on `127.0.0.1:4317` and opens a one-time authentication URL in your browser. Select **＋ 新しいセッション** (New Session) in the top-right corner to choose a command, arguments, working directory, and optional agent integration.
+The web app runs on `127.0.0.1:8372` and proxies API and WebSocket traffic to the daemon on `127.0.0.1:8371`. The daemon opens a one-time authentication URL in your browser. Select **＋ 新しいセッション** (New Session) in the top-right corner to choose a command, arguments, working directory, and optional agent integration.
 
 Press `Ctrl+C` in the terminal running Panestra to stop the daemon. Stopping the daemon also terminates every PTY and process group managed by Panestra.
 
@@ -128,7 +128,7 @@ Common daemon options:
 
 | Option               | Description                                          | Default                                  |
 | -------------------- | ---------------------------------------------------- | ---------------------------------------- |
-| `--listen <ADDRESS>` | Listen address; must be an explicit loopback address | `127.0.0.1:4317`                         |
+| `--listen <ADDRESS>` | Listen address; must be an explicit loopback address | `127.0.0.1:8371`                         |
 | `--data-dir <PATH>`  | Database, history, and runtime credential directory  | `~/Library/Application Support/Panestra` |
 | `--web-dir <PATH>`   | Built web app directory                              | `web/dist`                               |
 | `--no-open`          | Do not open the browser at startup                   | Disabled                                 |

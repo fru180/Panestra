@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "concurrently --kill-others-on-fail --names web,daemon 'pnpm dev:web' 'pnpm dev:daemon'",
     "dev:web": "pnpm --filter @panestra/web dev",
-    "dev:daemon": "cargo run -p panestra-daemon -- --dev-web-origin http://127.0.0.1:5173",
+    "dev:daemon": "cargo run -p panestra-daemon -- --listen 127.0.0.1:8371 --dev-web-origin http://127.0.0.1:8372",
     "build": "pnpm --filter @panestra/web build && mise exec -- cargo build -p panestra-daemon --release",
     "check": "pnpm format:check && pnpm lint && pnpm --filter @panestra/web typecheck",
     "format": "prettier --write . && mise exec -- cargo fmt --all",
