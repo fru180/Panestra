@@ -11,15 +11,19 @@
     "dev:web": "pnpm --filter @panestra/web dev",
     "dev:daemon": "cargo run -p panestra-daemon -- --dev-web-origin http://127.0.0.1:5173",
     "build": "pnpm --filter @panestra/web build && mise exec -- cargo build -p panestra-daemon --release",
-    "check": "pnpm format:check && pnpm --filter @panestra/web check && mise exec -- cargo fmt --all --check && mise exec -- cargo clippy --workspace --all-targets -- -D warnings",
+    "check": "pnpm format:check && pnpm lint && pnpm --filter @panestra/web typecheck",
     "format": "prettier --write . && mise exec -- cargo fmt --all",
-    "format:check": "prettier --check .",
+    "format:check": "prettier --check . && mise exec -- cargo fmt --all --check",
+    "lint": "pnpm --filter @panestra/web lint && mise exec -- cargo clippy --workspace --all-targets -- -D warnings",
+    "lint:fix": "pnpm --filter @panestra/web lint:fix",
+    "prepare": "husky",
     "test": "pnpm test:web && pnpm test:rust",
     "test:web": "pnpm --filter @panestra/web test",
     "test:rust": "mise exec -- cargo test --workspace --all-targets"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
+    "husky": "^9.1.7",
     "prettier": "^3.6.2"
   }
 }

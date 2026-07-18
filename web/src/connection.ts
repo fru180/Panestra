@@ -3,6 +3,7 @@ import {
   encodeClient,
   PROTOCOL_VERSION,
   type ClientMessage,
+  type ProtocolWorkerMessage,
   type ServerMessage,
 } from "./protocol";
 
@@ -23,9 +24,8 @@ export class PanestraConnection {
   onError: (message: string) => void = () => undefined;
 
   constructor() {
-    this.#worker.onmessage = (event: MessageEvent) => {
-      if (event.data.type === "message")
-        this.onMessage(event.data.message as ServerMessage);
+    this.#worker.onmessage = (event: MessageEvent<ProtocolWorkerMessage>) => {
+      if (event.data.type === "message") this.onMessage(event.data.message);
       else if (event.data.type === "resync")
         this.requestResync(String(event.data.sessionId));
       else this.onError(String(event.data.error));

@@ -22,9 +22,9 @@ export function NewSessionDialog(props: Props) {
     "terminal" | "codex" | "claude"
   >("terminal");
   const [projectId, setProjectId] = createSignal("");
-  const [command, setCommand] = createSignal(props.shell || "/bin/zsh");
+  const [command, setCommand] = createSignal("");
   const [args, setArgs] = createSignal("-l");
-  const [cwd, setCwd] = createSignal(props.home);
+  const [cwd, setCwd] = createSignal("");
   const [historyEnabled, setHistoryEnabled] = createSignal(true);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
@@ -81,11 +81,11 @@ export function NewSessionDialog(props: Props) {
 
   return (
     <Show when={props.open}>
-      <div class="dialog-backdrop" onPointerDown={props.onClose}>
+      <div class="dialog-backdrop" onPointerDown={() => props.onClose()}>
         <form
           class="dialog"
           onPointerDown={(event) => event.stopPropagation()}
-          onSubmit={submit}
+          onSubmit={(event) => void submit(event)}
         >
           <header>
             <div>
@@ -95,7 +95,7 @@ export function NewSessionDialog(props: Props) {
             <button
               type="button"
               class="icon-button"
-              onClick={props.onClose}
+              onClick={() => props.onClose()}
               aria-label="閉じる"
             >
               ×
@@ -176,7 +176,11 @@ export function NewSessionDialog(props: Props) {
             <p class="form-error">{error()}</p>
           </Show>
           <footer>
-            <button type="button" class="secondary" onClick={props.onClose}>
+            <button
+              type="button"
+              class="secondary"
+              onClick={() => props.onClose()}
+            >
               キャンセル
             </button>
             <button type="submit" class="primary" disabled={busy()}>

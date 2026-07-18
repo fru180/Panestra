@@ -59,6 +59,11 @@ export type ServerMessage =
   | { ProtocolError: { message: string } }
   | "Heartbeat";
 
+export type ProtocolWorkerMessage =
+  | { type: "message"; message: ServerMessage }
+  | { type: "resync"; sessionId: string }
+  | { type: "error"; error: string };
+
 export type ClientMessage =
   | { Hello: { protocol_version: number } }
   | { Subscribe: { session_ids: string[] } }

@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 
 import { decodeServer } from "./protocol";
-import type { ServerMessage } from "./protocol";
+import type { ProtocolWorkerMessage, ServerMessage } from "./protocol";
 import type { ScreenSnapshot } from "./types";
 
 const snapshots = new Map<
@@ -15,11 +15,15 @@ const snapshots = new Map<
 >();
 const applied = new Map<string, ScreenSnapshot>();
 
+function postMessage(message: ProtocolWorkerMessage): void {
+  self.postMessage(message);
+}
+
 self.onmessage = (event: MessageEvent<ArrayBuffer>) => {
   try {
     const message = decodeServer(event.data);
     if (typeof message === "string") {
-      self.postMessage({ type: "message", message });
+      postMessage({ type: "message", message });
       return;
     }
     if ("FullSnapshotBegin" in message) {
@@ -59,7 +63,7 @@ self.onmessage = (event: MessageEvent<ArrayBuffer>) => {
       snapshots.delete(end.session_id);
       applied.set(end.session_id, pending.snapshot);
       const completed: ServerMessage = { FullSnapshot: pending.snapshot };
-      self.postMessage({ type: "message", message: completed });
+      postMessage({ type: "message", message: completed });
       return;
     }
     if ("ScreenDiff" in message) {
@@ -72,7 +76,7 @@ self.onmessage = (event: MessageEvent<ArrayBuffer>) => {
         current.snapshotEpoch !== diff.snapshot.snapshotEpoch ||
         current.sequenceNumber !== diff.base_sequence_number
       ) {
-        self.postMessage({
+        postMessage({
           type: "resync",
           sessionId: diff.snapshot.sessionId,
         });
@@ -93,12 +97,12 @@ self.onmessage = (event: MessageEvent<ArrayBuffer>) => {
       };
       applied.set(next.sessionId, next);
       const completed: ServerMessage = { FullSnapshot: next };
-      self.postMessage({ type: "message", message: completed });
+      postMessage({ type: "message", message: completed });
       return;
     }
-    self.postMessage({ type: "message", message });
+    postMessage({ type: "message", message });
   } catch (error) {
-    self.postMessage({
+    postMessage({
       type: "error",
       error: error instanceof Error ? error.message : String(error),
     });

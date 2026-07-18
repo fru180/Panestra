@@ -6,6 +6,7 @@ import {
   createSignal,
   onCleanup,
   onMount,
+  untrack,
 } from "solid-js";
 
 import type { PanestraConnection } from "./connection";
@@ -199,7 +200,7 @@ export function TerminalGrid(props: Props) {
         window.setTimeout(() => {
           resizeTimers.delete(session.id);
           lastRequestedSizes.set(session.id, key);
-          props.connection.resize(session.id, target);
+          untrack(() => props.connection.resize(session.id, target));
         }, 75),
       );
     }
@@ -263,7 +264,7 @@ export function TerminalGrid(props: Props) {
       );
       return;
     }
-    event.currentTarget instanceof Element &&
+    if (event.currentTarget instanceof Element)
       event.currentTarget.setPointerCapture(event.pointerId);
     setSelection({ sessionId: id, start: cell, end: cell });
   }

@@ -63,3 +63,18 @@ target/release/panestra-daemon
 mise run check
 mise run test
 ```
+
+個別にlint、フォーマットを実行する場合:
+
+```sh
+pnpm lint
+pnpm lint:fix
+pnpm format
+pnpm format:check
+```
+
+`lint:fix`はWebコードに対してESLintの安全な自動修正を適用します。`format`はWebコードをPrettier、Rustコードをrustfmtで整形します。
+
+依存関係のインストール時にHuskyのpre-commit hookが設定されます。コミット前には`pnpm check`と`pnpm test`が実行され、lint、フォーマット、型、テストのいずれかに問題がある場合はコミットを中止します。
+
+`stg`または`main`を対象とするPull Requestでは、同じ検証をGitHub Actionsでも実行します。

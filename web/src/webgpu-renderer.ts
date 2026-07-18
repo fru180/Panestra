@@ -18,7 +18,6 @@ export type PaneRenderModel = {
 };
 
 const FLOATS_PER_VERTEX = 9;
-const VERTICES_PER_QUAD = 6;
 const FONT = '600 32px "SFMono-Semibold", "SF Mono", Menlo, Monaco, monospace';
 const ATLAS_COLUMNS = 32;
 const MAX_ATLAS_GLYPHS = 4096;

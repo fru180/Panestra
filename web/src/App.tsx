@@ -7,7 +7,9 @@ import {
   createSignal,
   onCleanup,
   onMount,
+  untrack,
 } from "solid-js";
+import type { JSX } from "solid-js";
 
 import {
   createProject as createProjectApi,
@@ -88,9 +90,10 @@ export default function App() {
   let gitRefreshTimer: number | undefined;
 
   const visibleSessions = createMemo(() => {
+    const statuses = gitStatuses();
     let source = attentionOnly()
       ? sessions().filter((session) =>
-          needsAttention(session, gitStatuses().get(session.id)),
+          needsAttention(session, statuses.get(session.id)),
         )
       : sessions();
     if (selectedProjectId()) {
@@ -100,8 +103,8 @@ export default function App() {
     }
     return [...source].sort((left, right) => {
       return (
-        attentionRank(right, gitStatuses().get(right.id)) -
-        attentionRank(left, gitStatuses().get(left.id))
+        attentionRank(right, statuses.get(right.id)) -
+        attentionRank(left, statuses.get(left.id))
       );
     });
   });
@@ -160,7 +163,7 @@ export default function App() {
       setStartup("ready");
       void refreshGitStatuses(visibleInitialActions);
       gitRefreshTimer = window.setInterval(
-        () => void refreshGitStatuses([...actionContexts().values()]),
+        () => void refreshGitStatuses([...untrack(actionContexts).values()]),
         5_000,
       );
     } catch (caught) {
@@ -307,7 +310,9 @@ export default function App() {
   async function stop(id: string): Promise<void> {
     await terminateSession(id);
     window.setTimeout(() => {
-      const session = sessions().find((candidate) => candidate.id === id);
+      const session = untrack(sessions).find(
+        (candidate) => candidate.id === id,
+      );
       if (
         session?.processState === "running" &&
         window.confirm(
@@ -640,7 +645,7 @@ function readTerminalDisplaySize(): TerminalDisplaySize {
 function StartupCard(props: {
   title: string;
   detail: string;
-  children?: unknown;
+  children?: JSX.Element;
 }) {
   return (
     <main class="startup">
@@ -649,7 +654,7 @@ function StartupCard(props: {
         <span class="eyebrow">PANESTRA</span>
         <h1>{props.title}</h1>
         <p>{props.detail}</p>
-        {props.children as any}
+        {props.children}
       </div>
     </main>
   );
