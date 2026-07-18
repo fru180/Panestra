@@ -636,11 +636,15 @@ async fn terminate_session(
     Query(query): Query<TerminateQuery>,
 ) -> Result<StatusCode, ApiError> {
     authorize(&state, &headers)?;
+    if state.sessions.get(id).is_none() {
+        return Err(ApiError::not_found("session not found"));
+    }
     state
         .sessions
-        .terminate(id, query.force)
-        .map_err(ApiError::not_found)?;
-    Ok(StatusCode::ACCEPTED)
+        .terminate_and_wait(id, query.force)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn websocket_ticket(

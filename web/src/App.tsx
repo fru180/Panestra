@@ -14,7 +14,6 @@ import type { JSX } from "solid-js";
 import {
   createProject as createProjectApi,
   createSession,
-  deleteSessionRecord,
   exchangeBootstrap,
   getCredential,
   getEnvironment,
@@ -75,6 +74,9 @@ export default function App() {
   const [expandedId, setExpandedId] = createSignal<string>();
   const [leaseSessionId, setLeaseSessionId] = createSignal<string>();
   const [resizeLeaseSessionIds, setResizeLeaseSessionIds] = createSignal(
+    new Set<string>(),
+  );
+  const [deletingSessionIds, setDeletingSessionIds] = createSignal(
     new Set<string>(),
   );
   const [terminalDisplaySize, setTerminalDisplaySize] =
@@ -307,22 +309,28 @@ export default function App() {
     activate(session.id);
   }
 
-  async function stop(id: string): Promise<void> {
-    await terminateSession(id);
-    window.setTimeout(() => {
-      const session = untrack(sessions).find(
-        (candidate) => candidate.id === id,
-      );
-      if (
-        session?.processState === "running" &&
-        window.confirm(
-          `${session.name} は終了していません。プロセスグループを強制終了しますか？`,
-        )
+  async function deleteTerminal(id: string): Promise<void> {
+    const session = untrack(sessions).find((candidate) => candidate.id === id);
+    if (!session || untrack(deletingSessionIds).has(id)) return;
+    if (
+      !window.confirm(
+        `${session.name} と管理下のプロセスを終了して画面から削除します。記録と履歴は保持されます。続行しますか？`,
       )
-        void terminateSession(id, true).catch((caught) =>
-          setError(caught instanceof Error ? caught.message : String(caught)),
-        );
-    }, 2_500);
+    )
+      return;
+    setDeletingSessionIds((current) => new Set(current).add(id));
+    try {
+      await terminateSession(id);
+      removeSession(id);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setDeletingSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }
   }
 
   function removeSession(id: string): void {
@@ -348,28 +356,6 @@ export default function App() {
     });
     if (activeId() === id) setActiveId(undefined);
     if (expandedId() === id) setExpandedId(undefined);
-  }
-
-  async function removeRecord(id: string): Promise<void> {
-    const choice = window.prompt(
-      "削除方法を入力してください: metadata（履歴ファイルを残す） / all（履歴も完全削除）",
-      "metadata",
-    );
-    if (choice !== "metadata" && choice !== "all") return;
-    const includeHistory = choice === "all";
-    if (
-      includeHistory &&
-      !window.confirm(
-        "確定済み画面と履歴を完全に削除します。この操作は復元できません。",
-      )
-    )
-      return;
-    try {
-      await deleteSessionRecord(id, includeHistory);
-      removeSession(id);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    }
   }
 
   async function addProject(): Promise<void> {
@@ -504,45 +490,45 @@ export default function App() {
               <span class="eyebrow">SESSIONS</span>
               <For each={visibleSessions()}>
                 {(session) => (
-                  <button
+                  <div
+                    class="session-list-item"
                     classList={{ active: session.id === activeId() }}
-                    onClick={() => activate(session.id)}
                   >
-                    <span
-                      class={`state-dot state-${session.agentState ?? session.processState}`}
-                    />
-                    <span>
-                      <strong>{session.name}</strong>
-                      <small>{session.launchCwd.split("/").at(-1)}</small>
-                    </span>
-                    <Show when={session.processState === "running"}>
-                      <i
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void stop(session.id);
-                        }}
-                        title="終了"
-                      >
-                        ■
-                      </i>
-                    </Show>
+                    <button
+                      type="button"
+                      class="session-selector"
+                      onClick={() => activate(session.id)}
+                    >
+                      <span
+                        class={`state-dot state-${session.agentState ?? session.processState}`}
+                      />
+                      <span>
+                        <strong>{session.name}</strong>
+                        <small>{session.launchCwd.split("/").at(-1)}</small>
+                      </span>
+                    </button>
                     <Show
                       when={
-                        session.processState !== "running" &&
-                        session.processState !== "starting"
+                        session.processState === "running" ||
+                        session.processState === "starting"
                       }
                     >
-                      <i
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void removeRecord(session.id);
-                        }}
-                        title="記録を削除"
+                      <button
+                        type="button"
+                        class="session-delete"
+                        aria-label={`${session.name}を削除`}
+                        disabled={deletingSessionIds().has(session.id)}
+                        onClick={() => void deleteTerminal(session.id)}
+                        title={
+                          deletingSessionIds().has(session.id)
+                            ? "削除中"
+                            : "ターミナルを削除"
+                        }
                       >
-                        ×
-                      </i>
+                        {deletingSessionIds().has(session.id) ? "…" : "×"}
+                      </button>
                     </Show>
-                  </button>
+                  </div>
                 )}
               </For>
             </div>
@@ -606,7 +592,9 @@ export default function App() {
                 !gpuRecovering(),
               )}
               resizeLeaseIds={resizeLeaseSessionIds()}
+              deletingIds={deletingSessionIds()}
               onActivate={activate}
+              onDelete={(id) => void deleteTerminal(id)}
               onToggleExpanded={(id) =>
                 setExpandedId((current) => (current === id ? undefined : id))
               }

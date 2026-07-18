@@ -42,7 +42,9 @@ type Props = {
   displaySize: TerminalDisplaySize;
   leaseOwned: boolean;
   resizeLeaseIds: ReadonlySet<string>;
+  deletingIds: ReadonlySet<string>;
   onActivate: (id: string) => void;
+  onDelete: (id: string) => void;
   onToggleExpanded: (id: string) => void;
   onBrowseHistory: (id: string) => void;
   onDeviceLost: (reason: string) => void;
@@ -411,6 +413,21 @@ export function TerminalGrid(props: Props) {
                     }}
                   >
                     {props.expandedId ? "縮小" : "拡大"}
+                  </button>
+                  <button
+                    type="button"
+                    class="delete-terminal"
+                    aria-label={`${session.name}を削除`}
+                    title={
+                      props.deletingIds.has(session.id)
+                        ? "削除中"
+                        : "ターミナルを削除"
+                    }
+                    disabled={props.deletingIds.has(session.id)}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={() => props.onDelete(session.id)}
+                  >
+                    {props.deletingIds.has(session.id) ? "削除中" : "削除"}
                   </button>
                 </div>
               </header>

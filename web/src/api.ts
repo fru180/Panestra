@@ -125,11 +125,8 @@ export async function createSession(
   });
 }
 
-export async function terminateSession(
-  id: string,
-  force = false,
-): Promise<void> {
-  await authorizedJson(`/api/sessions/${id}?force=${String(force)}`, {
+export async function terminateSession(id: string): Promise<void> {
+  await authorizedJson(`/api/sessions/${id}`, {
     method: "DELETE",
   });
 }

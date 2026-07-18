@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -12,7 +12,9 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use parking_lot::{Mutex, RwLock};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+#[cfg(not(target_os = "macos"))]
+use portable_pty::ChildKiller;
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tokio::sync::broadcast;
@@ -35,6 +37,17 @@ const HISTORY_PENDING_LIMIT: usize = 1024 * 1024;
 const HISTORY_DISK_LIMIT: u64 = 64 * 1024 * 1024;
 const HISTORY_READ_LIMIT: usize = 8 * 1024 * 1024;
 const INTEGRATION_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const TERMINATION_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(2500);
+const TERMINATION_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+const TERMINATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ManagedProcess {
+    pid: i32,
+    started_at_seconds: u64,
+    started_at_microseconds: u64,
+}
 
 #[derive(Default)]
 struct HistoryBuffer {
@@ -89,8 +102,14 @@ pub struct SessionHandle {
     metadata: Arc<RwLock<Session>>,
     writer: Mutex<Box<dyn Write + Send>>,
     pty_master: Mutex<Box<dyn MasterPty + Send>>,
+    #[cfg(not(target_os = "macos"))]
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    #[cfg(not(target_os = "macos"))]
     process_group_id: Option<i32>,
+    #[cfg(target_os = "macos")]
+    root_process: Option<ManagedProcess>,
+    #[cfg(target_os = "macos")]
+    managed_processes: Mutex<HashSet<ManagedProcess>>,
     terminal: Arc<Mutex<vt100::Parser<TerminalCallbacks>>>,
     snapshot_epoch: Uuid,
     sequence: AtomicU64,
@@ -189,23 +208,139 @@ impl SessionHandle {
     }
 
     pub fn terminate_gracefully(&self) -> Result<()> {
-        if self.metadata.read().process_state != ProcessState::Running {
-            return Ok(());
+        #[cfg(target_os = "macos")]
+        {
+            self.signal_managed_processes(libc::SIGTERM)
         }
-        #[cfg(unix)]
-        if let Some(process_group_id) = self.process_group_id {
-            // Negative pid addresses the whole process group created for this PTY.
-            let result = unsafe { libc::kill(-process_group_id, libc::SIGTERM) };
-            if result == 0 {
+        #[cfg(not(target_os = "macos"))]
+        {
+            #[cfg(unix)]
+            if self.process_group_id.is_some() {
+                return self.signal_process_group(libc::SIGTERM);
+            }
+            if self.metadata.read().process_state != ProcessState::Running {
                 return Ok(());
             }
+            self.killer.lock().kill().map_err(Into::into)
         }
-        self.killer.lock().kill().map_err(Into::into)
     }
 
     pub fn kill(&self) -> Result<()> {
         self.forced_termination.store(true, Ordering::Release);
-        self.killer.lock().kill().map_err(Into::into)
+        #[cfg(target_os = "macos")]
+        {
+            self.signal_managed_processes(libc::SIGKILL)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            #[cfg(unix)]
+            if self.process_group_id.is_some() {
+                return self.signal_process_group(libc::SIGKILL);
+            }
+            self.killer.lock().kill().map_err(Into::into)
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn signal_process_group(&self, signal: i32) -> Result<()> {
+        let process_group_id = self
+            .process_group_id
+            .context("terminal process group is unavailable")?;
+        // A negative pid addresses the whole process group created for this PTY.
+        if unsafe { libc::kill(-process_group_id, signal) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(error).context("failed to signal terminal process group")
+    }
+
+    fn process_group_is_alive(&self) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            self.managed_processes_are_alive()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            #[cfg(unix)]
+            if let Some(process_group_id) = self.process_group_id {
+                if unsafe { libc::kill(-process_group_id, 0) } == 0 {
+                    return Ok(true);
+                }
+                let error = std::io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(libc::ESRCH) => Ok(false),
+                    Some(libc::EPERM) => Ok(true),
+                    _ => Err(error).context("failed to inspect terminal process group"),
+                };
+            }
+            Ok(matches!(
+                self.metadata.read().process_state,
+                ProcessState::Starting | ProcessState::Running
+            ))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn signal_managed_processes(&self, signal: i32) -> Result<()> {
+        let mut tracked = self.managed_processes.lock();
+        self.refresh_managed_processes(&mut tracked)?;
+        let root_pid = self.root_process.map(|process| process.pid);
+        let mut processes: Vec<_> = tracked.iter().copied().collect();
+        processes.sort_by_key(|process| Some(process.pid) == root_pid);
+        for process in processes {
+            if macos_process_identity(process.pid)? != Some(process) {
+                continue;
+            }
+            if unsafe { libc::kill(process.pid, signal) } == 0 {
+                continue;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("failed to signal a managed terminal process");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn managed_processes_are_alive(&self) -> Result<bool> {
+        let mut tracked = self.managed_processes.lock();
+        self.refresh_managed_processes(&mut tracked)?;
+        let mut alive = HashSet::with_capacity(tracked.len());
+        for process in tracked.iter().copied() {
+            if macos_process_identity(process.pid)? == Some(process) {
+                alive.insert(process);
+            }
+        }
+        *tracked = alive;
+        Ok(!tracked.is_empty())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn refresh_managed_processes(&self, tracked: &mut HashSet<ManagedProcess>) -> Result<()> {
+        if let Some(root) = self.root_process
+            && macos_process_identity(root.pid)? == Some(root)
+        {
+            tracked.insert(root);
+        }
+        let mut queue: VecDeque<_> = tracked.iter().copied().collect();
+        let mut visited = HashSet::new();
+        while let Some(process) = queue.pop_front() {
+            if !visited.insert(process) || macos_process_identity(process.pid)? != Some(process) {
+                continue;
+            }
+            for child_pid in macos_child_processes(process.pid)? {
+                if let Some(child) = macos_process_identity(child_pid)?
+                    && tracked.insert(child)
+                {
+                    queue.push_back(child);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_terminal_modes(&self, data: &[u8]) {
@@ -438,11 +573,17 @@ impl SessionManager {
         let watchdog: Option<std::os::unix::net::UnixStream> = None;
         drop(pair.slave);
         let pid = child.process_id();
+        #[cfg(not(target_os = "macos"))]
         let killer = child.clone_killer();
         #[cfg(unix)]
         let process_group_id = pair.master.process_group_leader();
         #[cfg(not(unix))]
         let process_group_id = None;
+        #[cfg(target_os = "macos")]
+        let root_process = process_group_id
+            .map(macos_process_identity)
+            .transpose()?
+            .flatten();
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -493,8 +634,14 @@ impl SessionManager {
             metadata: Arc::clone(&metadata_shared),
             writer: Mutex::new(writer),
             pty_master: Mutex::new(pair.master),
+            #[cfg(not(target_os = "macos"))]
             killer: Mutex::new(killer),
+            #[cfg(not(target_os = "macos"))]
             process_group_id,
+            #[cfg(target_os = "macos")]
+            root_process,
+            #[cfg(target_os = "macos")]
+            managed_processes: Mutex::new(root_process.into_iter().collect()),
             terminal: Arc::clone(&terminal),
             snapshot_epoch: Uuid::new_v4(),
             sequence: AtomicU64::new(0),
@@ -732,13 +879,40 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn terminate(&self, id: Uuid, force: bool) -> Result<()> {
+    pub async fn terminate_and_wait(&self, id: Uuid, force: bool) -> Result<()> {
         let handle = self.get(id).ok_or_else(|| anyhow!("session not found"))?;
-        if force {
-            handle.kill()
-        } else {
-            handle.terminate_gracefully()
+        if !handle.process_group_is_alive()? {
+            return Ok(());
         }
+        if force {
+            handle.kill()?;
+        } else {
+            handle.terminate_gracefully()?;
+            if wait_for_process_group_exit(&handle, TERMINATION_GRACE_PERIOD).await? {
+                return Ok(());
+            }
+            handle.kill()?;
+        }
+        if wait_for_process_group_exit(&handle, TERMINATION_CONFIRM_TIMEOUT).await? {
+            self.record_forced_termination(&handle);
+            return Ok(());
+        }
+        bail!("terminal process group did not exit after SIGKILL")
+    }
+
+    fn record_forced_termination(&self, handle: &SessionHandle) {
+        let updated = {
+            let mut metadata = handle.metadata.write();
+            metadata.process_state = ProcessState::Killed;
+            metadata.exit_reason = Some(ExitReason::Forced);
+            metadata.pid = None;
+            metadata.exited_at.get_or_insert_with(Utc::now);
+            metadata.clone()
+        };
+        if let Err(error) = self.store.upsert_session(&updated) {
+            tracing::error!(session_id = %updated.id, %error, "failed to record forced terminal deletion");
+        }
+        let _ = self.events.send(DaemonEvent::SessionState(updated));
     }
 
     pub fn delete_record(&self, id: Uuid, include_history: bool) -> Result<()> {
@@ -877,6 +1051,78 @@ impl SessionManager {
             output.extend_from_slice(&strip_ansi_escapes::strip(&bytes));
         }
         Ok(output)
+    }
+}
+
+async fn wait_for_process_group_exit(
+    handle: &SessionHandle,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !handle.process_group_is_alive()? {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(TERMINATION_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_identity(pid: i32) -> Result<Option<ManagedProcess>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected,
+        )
+    };
+    if read <= 0 {
+        return Ok(None);
+    }
+    if read != expected {
+        bail!("received incomplete process information for pid {pid}");
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(Some(ManagedProcess {
+        pid,
+        started_at_seconds: info.pbi_start_tvsec,
+        started_at_microseconds: info.pbi_start_tvusec,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_child_processes(pid: i32) -> Result<Vec<i32>> {
+    let mut capacity = 32_usize;
+    loop {
+        let mut children = vec![0_i32; capacity];
+        let count = unsafe {
+            libc::proc_listchildpids(
+                pid,
+                children.as_mut_ptr().cast(),
+                std::mem::size_of_val(children.as_slice()) as i32,
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to list managed terminal child processes");
+        }
+        let count = count as usize;
+        if count < capacity {
+            children.truncate(count);
+            children.retain(|child| *child > 0);
+            return Ok(children);
+        }
+        capacity = capacity
+            .checked_mul(2)
+            .filter(|next| *next <= 4096)
+            .context("managed terminal process tree is too large")?;
     }
 }
 
@@ -1307,7 +1553,7 @@ mod tests {
                 history_enabled: false,
             })
             .unwrap();
-        manager.terminate(session.id, true).unwrap();
+        manager.get(session.id).unwrap().kill().unwrap();
         for _ in 0..100 {
             let metadata = manager.get(session.id).unwrap().metadata();
             if metadata.process_state == ProcessState::Killed {
@@ -1317,5 +1563,92 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("forced process did not reach killed state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_deletion_escalates_and_kills_the_whole_process_group() {
+        let store = Store::open_memory().unwrap();
+        let manager = SessionManager::new(
+            store.clone(),
+            Uuid::new_v4(),
+            IntegrationManager::for_tests(),
+            std::env::temp_dir().join(format!("panestra-test-{}", Uuid::new_v4())),
+        );
+        let child_pid_file = tempfile::NamedTempFile::new().unwrap();
+        let child_pid_path = child_pid_file.path().to_string_lossy();
+        let command = format!(
+            "(trap '' TERM HUP; while :; do sleep 1; done) & echo $! > '{child_pid_path}'; echo READY; wait"
+        );
+        let session = manager
+            .create(CreateSessionRequest {
+                name: "delete".into(),
+                project_id: None,
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), command],
+                cwd: "/tmp".into(),
+                env: HashMap::new(),
+                agent_integration: None,
+                cols: None,
+                rows: None,
+                history_enabled: true,
+            })
+            .unwrap();
+
+        let ready = (0..100).any(|_| {
+            if manager
+                .snapshot(session.id)
+                .is_ok_and(|snapshot| snapshot.contents.contains("READY"))
+            {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
+        assert!(ready, "test process group did not become ready");
+        let child_pid: i32 = std::fs::read_to_string(child_pid_file.path())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let handle = manager.get(session.id).unwrap();
+        assert!(handle.root_process.is_some());
+        {
+            let mut tracked = handle.managed_processes.lock();
+            handle.refresh_managed_processes(&mut tracked).unwrap();
+            assert!(
+                tracked.iter().any(|process| process.pid == child_pid),
+                "background child was not captured before terminal deletion: {tracked:?}"
+            );
+        }
+
+        manager.terminate_and_wait(session.id, false).await.unwrap();
+
+        assert!(!handle.process_group_is_alive().unwrap());
+        let metadata = handle.metadata();
+        assert_eq!(metadata.process_state, ProcessState::Killed);
+        assert_eq!(metadata.exit_reason, Some(ExitReason::Forced));
+        let child_reaped = (0..100).any(|_| {
+            if unsafe { libc::kill(child_pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
+        assert!(child_reaped, "background child survived terminal deletion");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert!(
+            store
+                .list_sessions()
+                .unwrap()
+                .iter()
+                .any(|stored| stored.id == session.id),
+            "terminal deletion must preserve the session record"
+        );
     }
 }
