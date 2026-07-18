@@ -1,0 +1,25 @@
+{
+  "name": "panestra",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.15.1",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "concurrently --kill-others-on-fail --names web,daemon 'pnpm dev:web' 'pnpm dev:daemon'",
+    "dev:web": "pnpm --filter @panestra/web dev",
+    "dev:daemon": "cargo run -p panestra-daemon -- --dev-web-origin http://127.0.0.1:5173",
+    "build": "pnpm --filter @panestra/web build && mise exec -- cargo build -p panestra-daemon --release",
+    "check": "pnpm format:check && pnpm --filter @panestra/web check && mise exec -- cargo fmt --all --check && mise exec -- cargo clippy --workspace --all-targets -- -D warnings",
+    "format": "prettier --write . && mise exec -- cargo fmt --all",
+    "format:check": "prettier --check .",
+    "test": "pnpm test:web && pnpm test:rust",
+    "test:web": "pnpm --filter @panestra/web test",
+    "test:rust": "mise exec -- cargo test --workspace --all-targets"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "prettier": "^3.6.2"
+  }
+}

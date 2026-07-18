@@ -1,0 +1,16 @@
+.DS_Store
+.mise.local.toml
+.env
+node_modules/
+dist/
+target/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+tmp/
+*.db
+*.db-shm
+*.db-wal
