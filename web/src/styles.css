@@ -163,19 +163,27 @@ button {
 .session-list > .eyebrow {
   padding: 0 10px 8px;
 }
-.session-list button {
+.session-list .session-selector {
   width: 100%;
   display: grid;
-  grid-template-columns: 8px 1fr 18px;
+  grid-template-columns: 8px 1fr;
   gap: 9px;
   align-items: center;
   padding: 8px 9px;
-  border-radius: 7px;
   color: #92a0ad;
 }
-.session-list button:hover,
-.session-list button.active {
+.session-list-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  border-radius: 7px;
+}
+.session-list-item:hover,
+.session-list-item.active {
   background: #131d25;
+}
+.session-list-item:hover .session-selector,
+.session-list-item.active .session-selector {
   color: #e5edf4;
 }
 .session-list strong,
@@ -193,11 +201,21 @@ button {
   color: #607181;
   margin-top: 2px;
 }
-.session-list i {
-  font-style: normal;
+.session-list .session-delete {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
   font-size: 8px;
   color: #596a78;
-  padding: 5px;
+  padding: 0;
+}
+.session-list .session-delete:hover:not(:disabled) {
+  color: #ef8b83;
+}
+.session-list .session-delete:disabled {
+  cursor: wait;
+  opacity: 0.5;
 }
 .connection-status {
   height: 46px;
@@ -505,6 +523,17 @@ button.primary {
   padding: 4px 7px;
   font-size: 9px;
   color: #8392a0;
+}
+.pane-header .delete-terminal {
+  color: #c77c82;
+}
+.pane-header .delete-terminal:hover:not(:disabled) {
+  color: #ff9ba2;
+  border-color: #7d4148;
+}
+.pane-header button:disabled {
+  cursor: wait;
+  opacity: 0.5;
 }
 .lease-warning {
   color: #f1b75d;
