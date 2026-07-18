@@ -10,7 +10,7 @@ use clap::Parser;
     about = "Local multi-terminal command center"
 )]
 pub struct Arguments {
-    #[arg(long, default_value = "127.0.0.1:4317")]
+    #[arg(long, default_value = "127.0.0.1:8371")]
     pub listen: SocketAddr,
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
@@ -71,4 +71,41 @@ pub fn default_data_dir() -> Result<PathBuf> {
         .join("Library")
         .join("Application Support")
         .join("Panestra"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_the_panestra_daemon_port() {
+        let arguments = Arguments::parse_from([
+            "panestra",
+            "--data-dir",
+            "/tmp/panestra-test",
+            "--web-dir",
+            "/tmp/panestra-web",
+        ]);
+        let config = Config::from_args(arguments).unwrap();
+
+        assert_eq!(config.listen, "127.0.0.1:8371".parse().unwrap());
+        assert_eq!(config.browser_origin, "http://127.0.0.1:8371");
+    }
+
+    #[test]
+    fn development_origin_does_not_change_the_daemon_port() {
+        let arguments = Arguments::parse_from([
+            "panestra",
+            "--data-dir",
+            "/tmp/panestra-test",
+            "--web-dir",
+            "/tmp/panestra-web",
+            "--dev-web-origin",
+            "http://127.0.0.1:8372",
+        ]);
+        let config = Config::from_args(arguments).unwrap();
+
+        assert_eq!(config.listen, "127.0.0.1:8371".parse().unwrap());
+        assert_eq!(config.browser_origin, "http://127.0.0.1:8372");
+    }
 }
