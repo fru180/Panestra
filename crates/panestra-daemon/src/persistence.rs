@@ -139,6 +139,7 @@ impl Store {
               ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22
             ) ON CONFLICT(id) DO UPDATE SET
               current_cwd=excluded.current_cwd,
+              agent_integration=excluded.agent_integration,
               agent_state=excluded.agent_state,
               process_state=excluded.process_state,
               pid=excluded.pid,

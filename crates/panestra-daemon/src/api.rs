@@ -31,8 +31,9 @@ use crate::{
     git::GitService,
     integration::IntegrationManager,
     model::{
-        ActionContext, AgentState, CreateProjectRequest, CreateSessionRequest, GitStatus,
-        HistoryPage, HistorySearchResult, Project, ReportActionStartInput, ScreenSnapshot, Session,
+        ActionContext, AgentIntegration, AgentState, CreateProjectRequest, CreateSessionRequest,
+        GitStatus, HistoryPage, HistorySearchResult, Project, ReportActionStartInput,
+        ScreenSnapshot, Session,
     },
     persistence::Store,
     protocol::{ClientMessage, PROTOCOL_VERSION, ServerMessage, decode_client, encode},
@@ -87,6 +88,18 @@ pub fn router(state: AppState) -> Router {
         .route("/ws", get(websocket_upgrade))
         .route("/integrations/{id}/hook", post(agent_hook))
         .route("/integrations/{id}/mcp", post(mcp_request))
+        .route(
+            "/integrations/{id}/runtime/{provider}/{invocation_id}",
+            post(dynamic_agent_start),
+        )
+        .route(
+            "/integrations/{id}/hook/{provider}/{invocation_id}",
+            post(dynamic_agent_hook),
+        )
+        .route(
+            "/integrations/{id}/mcp/{provider}/{invocation_id}",
+            post(dynamic_mcp_request),
+        )
         .layer(DefaultBodyLimit::max(1024 * 1024));
 
     let fallback = ServeDir::new(&state.config.web_dir)
@@ -343,6 +356,83 @@ async fn agent_hook(
     Ok(Json(serde_json::json!({})))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DynamicAgentStart {
+    pid: u32,
+    integration_supported: bool,
+}
+
+async fn dynamic_agent_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, provider, invocation_id)): Path<(Uuid, AgentIntegration, Uuid)>,
+    Json(request): Json<DynamicAgentStart>,
+) -> Result<StatusCode, ApiError> {
+    let token = bearer(&headers)?;
+    if !state.integrations.authorize_terminal_hook(id, token) {
+        return Err(ApiError::unauthorized(
+            "invalid terminal integration credential",
+        ));
+    }
+    state
+        .sessions
+        .begin_dynamic_agent(
+            id,
+            invocation_id,
+            provider,
+            request.pid,
+            request.integration_supported,
+        )
+        .map_err(ApiError::bad_request)?;
+    let sessions = state.sessions.clone();
+    tokio::spawn(async move {
+        sessions.monitor_dynamic_agent(id, invocation_id).await;
+    });
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn dynamic_agent_hook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, provider, invocation_id)): Path<(Uuid, AgentIntegration, Uuid)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = bearer(&headers)?;
+    if !state.integrations.authorize_terminal_hook(id, token) {
+        return Err(ApiError::unauthorized("invalid terminal hook credential"));
+    }
+    let event = payload
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str);
+    let agent_state = match event {
+        Some("SessionStart") => AgentState::Initializing,
+        Some("UserPromptSubmit") => {
+            state
+                .sessions
+                .clear_current_action(id)
+                .map_err(ApiError::internal)?;
+            AgentState::Working
+        }
+        Some("PermissionRequest") => AgentState::WaitingApproval,
+        Some("Stop") => AgentState::AwaitingUser,
+        _ => {
+            let _ = state.sessions.update_dynamic_agent_state(
+                id,
+                invocation_id,
+                provider,
+                AgentState::IntegrationError,
+            );
+            return Err(ApiError::bad_request("unsupported or malformed hook event"));
+        }
+    };
+    state
+        .sessions
+        .update_dynamic_agent_state(id, invocation_id, provider, agent_state)
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(serde_json::json!({})))
+}
+
 async fn mcp_request(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -353,6 +443,35 @@ async fn mcp_request(
     if state.integrations.authorize_mcp(id, token).is_none() {
         return Err(ApiError::unauthorized("invalid session MCP credential"));
     }
+    mcp_response(state, id, request).await
+}
+
+async fn dynamic_mcp_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, provider, invocation_id)): Path<(Uuid, AgentIntegration, Uuid)>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let token = bearer(&headers)?;
+    if !state.integrations.authorize_terminal_mcp(id, token) {
+        return Err(ApiError::unauthorized("invalid terminal MCP credential"));
+    }
+    if !state
+        .sessions
+        .is_dynamic_agent_current(id, invocation_id, provider)
+    {
+        return Err(ApiError::bad_request(
+            "agent invocation is no longer active",
+        ));
+    }
+    mcp_response(state, id, request).await
+}
+
+async fn mcp_response(
+    state: AppState,
+    id: Uuid,
+    request: serde_json::Value,
+) -> Result<Response, ApiError> {
     if request.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
         return Ok(mcp_error(
             request.get("id").cloned(),

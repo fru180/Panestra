@@ -29,6 +29,10 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(provider) = integration::shim_provider() {
+        integration::run_agent_shim(provider)?;
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("hook-event") {
         integration::forward_hook_event()?;
         return Ok(());
@@ -62,7 +66,8 @@ async fn main() -> Result<()> {
     }
 
     let daemon_epoch = Uuid::new_v4();
-    let integrations = IntegrationManager::new(format!("http://{}", config.listen))?;
+    let integrations =
+        IntegrationManager::new(format!("http://{}", config.listen), &config.data_dir)?;
     let sessions = SessionManager::new(
         store.clone(),
         daemon_epoch,
