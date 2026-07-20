@@ -25,8 +25,9 @@ use uuid::Uuid;
 use crate::{
     integration::IntegrationManager,
     model::{
-        ActionContext, AgentState, CreateSessionRequest, ExitReason, MAX_COLS, MAX_ROWS,
-        MAX_SESSIONS, MIN_COLS, MIN_ROWS, ProcessState, ScreenSnapshot, Session, StyledCell,
+        ActionContext, AgentIntegration, AgentState, CreateSessionRequest, ExitReason, MAX_COLS,
+        MAX_ROWS, MAX_SESSIONS, MIN_COLS, MIN_ROWS, ProcessState, ScreenSnapshot, Session,
+        StyledCell,
     },
     persistence::{HistoryChunkRef, Store},
 };
@@ -55,6 +56,14 @@ struct ManagedProcess {
 struct HistoryBuffer {
     pending: Vec<u8>,
     next_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DynamicAgent {
+    invocation_id: Uuid,
+    provider: AgentIntegration,
+    pid: u32,
+    hook_event_received: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +128,7 @@ pub struct SessionHandle {
     history_commit: Mutex<()>,
     forced_termination: AtomicBool,
     integration_event_received: AtomicBool,
+    dynamic_agent: Mutex<Option<DynamicAgent>>,
     focus_reporting: AtomicBool,
     terminal_mode_tail: Mutex<Vec<u8>>,
     #[cfg(unix)]
@@ -493,6 +503,17 @@ impl SessionManager {
                     .prepare(id, provider, &request.command, &request.args)
             })
             .transpose()?;
+        let terminal_prepared = if request.agent_integration.is_none() {
+            let original_path = request
+                .env
+                .get("PATH")
+                .cloned()
+                .or_else(|| std::env::var("PATH").ok())
+                .unwrap_or_default();
+            Some(self.integrations.prepare_terminal(id, &original_path)?)
+        } else {
+            None
+        };
         let launch_args = prepared
             .as_ref()
             .map_or_else(|| request.args.clone(), |launch| launch.args.clone());
@@ -544,6 +565,11 @@ impl SessionManager {
             command.env(key, value);
         }
         if let Some(prepared) = &prepared {
+            for (key, value) in &prepared.env {
+                command.env(key, value);
+            }
+        }
+        if let Some(prepared) = &terminal_prepared {
             for (key, value) in &prepared.env {
                 command.env(key, value);
             }
@@ -651,6 +677,7 @@ impl SessionManager {
             history_commit: Mutex::new(()),
             forced_termination: AtomicBool::new(false),
             integration_event_received: AtomicBool::new(false),
+            dynamic_agent: Mutex::new(None),
             focus_reporting: AtomicBool::new(false),
             terminal_mode_tail: Mutex::new(Vec::new()),
             _watchdog: watchdog,
@@ -716,6 +743,11 @@ impl SessionManager {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 let mut session = wait_metadata.write();
+                if wait_handle.dynamic_agent.lock().take().is_some() {
+                    session.agent_integration = None;
+                    session.agent_state = None;
+                    session.current_action_id = None;
+                }
                 session.pid = None;
                 session.exited_at = Some(Utc::now());
                 match status {
@@ -862,6 +894,157 @@ impl SessionManager {
             session_id: id,
             state,
         });
+        Ok(())
+    }
+
+    pub fn begin_dynamic_agent(
+        &self,
+        id: Uuid,
+        invocation_id: Uuid,
+        provider: AgentIntegration,
+        pid: u32,
+        integration_supported: bool,
+    ) -> Result<()> {
+        let handle = self.get(id).ok_or_else(|| anyhow!("session not found"))?;
+        if handle.metadata().process_state != ProcessState::Running {
+            bail!("session is not running");
+        }
+        if handle.metadata().agent_integration.is_some() && handle.dynamic_agent.lock().is_none() {
+            bail!("fixed agent sessions cannot start a dynamic integration");
+        }
+        *handle.dynamic_agent.lock() = Some(DynamicAgent {
+            invocation_id,
+            provider,
+            pid,
+            hook_event_received: false,
+        });
+        self.clear_current_action(id)?;
+        let updated = {
+            let mut metadata = handle.metadata.write();
+            metadata.agent_integration = Some(provider);
+            metadata.agent_state = Some(if integration_supported {
+                AgentState::Initializing
+            } else {
+                AgentState::IntegrationError
+            });
+            let updated = metadata.clone();
+            self.store.upsert_session(&updated)?;
+            updated
+        };
+        let _ = self.events.send(DaemonEvent::SessionState(updated));
+        Ok(())
+    }
+
+    pub fn update_dynamic_agent_state(
+        &self,
+        id: Uuid,
+        invocation_id: Uuid,
+        provider: AgentIntegration,
+        state: AgentState,
+    ) -> Result<()> {
+        let handle = self.get(id).ok_or_else(|| anyhow!("session not found"))?;
+        {
+            let mut active = handle.dynamic_agent.lock();
+            let Some(agent) = active.as_mut() else {
+                bail!("session has no active terminal agent");
+            };
+            if agent.invocation_id != invocation_id || agent.provider != provider {
+                bail!("agent invocation is no longer active");
+            }
+            agent.hook_event_received = true;
+        }
+        {
+            let mut metadata = handle.metadata.write();
+            metadata.agent_state = Some(state);
+            self.store.upsert_session(&metadata)?;
+        }
+        let _ = self.events.send(DaemonEvent::AgentState {
+            session_id: id,
+            state,
+        });
+        Ok(())
+    }
+
+    pub fn is_dynamic_agent_current(
+        &self,
+        id: Uuid,
+        invocation_id: Uuid,
+        provider: AgentIntegration,
+    ) -> bool {
+        self.get(id).is_some_and(|handle| {
+            handle.dynamic_agent.lock().as_ref().is_some_and(|agent| {
+                agent.invocation_id == invocation_id && agent.provider == provider
+            })
+        })
+    }
+
+    pub async fn monitor_dynamic_agent(&self, id: Uuid, invocation_id: Uuid) {
+        let started = tokio::time::Instant::now();
+        let mut handshake_checked = false;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let Some(handle) = self.get(id) else { return };
+            let active = *handle.dynamic_agent.lock();
+            let Some(agent) = active.filter(|agent| agent.invocation_id == invocation_id) else {
+                return;
+            };
+            if !process_is_alive(agent.pid) {
+                let _ = self.end_dynamic_agent(id, invocation_id);
+                return;
+            }
+            if !handshake_checked && started.elapsed() >= INTEGRATION_HANDSHAKE_TIMEOUT {
+                handshake_checked = true;
+                if !agent.hook_event_received {
+                    let _ = self.set_dynamic_agent_error(id, invocation_id);
+                }
+            }
+        }
+    }
+
+    fn set_dynamic_agent_error(&self, id: Uuid, invocation_id: Uuid) -> Result<()> {
+        let handle = self.get(id).ok_or_else(|| anyhow!("session not found"))?;
+        if !handle
+            .dynamic_agent
+            .lock()
+            .as_ref()
+            .is_some_and(|agent| agent.invocation_id == invocation_id)
+        {
+            return Ok(());
+        }
+        {
+            let mut metadata = handle.metadata.write();
+            metadata.agent_state = Some(AgentState::IntegrationError);
+            self.store.upsert_session(&metadata)?;
+        }
+        let _ = self.events.send(DaemonEvent::AgentState {
+            session_id: id,
+            state: AgentState::IntegrationError,
+        });
+        Ok(())
+    }
+
+    fn end_dynamic_agent(&self, id: Uuid, invocation_id: Uuid) -> Result<()> {
+        let handle = self.get(id).ok_or_else(|| anyhow!("session not found"))?;
+        {
+            let mut active = handle.dynamic_agent.lock();
+            if !active
+                .as_ref()
+                .is_some_and(|agent| agent.invocation_id == invocation_id)
+            {
+                return Ok(());
+            }
+            *active = None;
+        }
+        self.clear_current_action(id)?;
+        let updated = {
+            let mut metadata = handle.metadata.write();
+            metadata.agent_integration = None;
+            metadata.agent_state = None;
+            let updated = metadata.clone();
+            self.store.upsert_session(&updated)?;
+            updated
+        };
+        let _ = self.events.send(DaemonEvent::SessionState(updated));
         Ok(())
     }
 
@@ -1070,6 +1253,16 @@ async fn wait_for_process_group_exit(
         }
         tokio::time::sleep(TERMINATION_POLL_INTERVAL).await;
     }
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(target_os = "macos")]
@@ -1565,6 +1758,80 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("forced process did not reach killed state");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dynamic_agent_state_is_persisted_and_stale_invocations_cannot_clear_it() {
+        let store = Store::open_memory().unwrap();
+        let manager = SessionManager::new(
+            store.clone(),
+            Uuid::new_v4(),
+            IntegrationManager::for_tests(),
+            std::env::temp_dir().join(format!("panestra-test-{}", Uuid::new_v4())),
+        );
+        let session = manager
+            .create(CreateSessionRequest {
+                name: "terminal-agent".into(),
+                project_id: None,
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 5".into()],
+                cwd: "/tmp".into(),
+                env: HashMap::new(),
+                agent_integration: None,
+                cols: None,
+                rows: None,
+                history_enabled: false,
+            })
+            .unwrap();
+        let pid = session.pid.unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+
+        manager
+            .begin_dynamic_agent(session.id, first, AgentIntegration::Codex, pid, true)
+            .unwrap();
+        manager
+            .update_dynamic_agent_state(
+                session.id,
+                first,
+                AgentIntegration::Codex,
+                AgentState::Working,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get(session.id).unwrap().metadata().agent_state,
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            store
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .find(|stored| stored.id == session.id)
+                .unwrap()
+                .agent_integration,
+            Some(AgentIntegration::Codex)
+        );
+
+        manager
+            .begin_dynamic_agent(session.id, second, AgentIntegration::Claude, pid, true)
+            .unwrap();
+        manager.end_dynamic_agent(session.id, first).unwrap();
+        assert_eq!(
+            manager
+                .get(session.id)
+                .unwrap()
+                .metadata()
+                .agent_integration,
+            Some(AgentIntegration::Claude)
+        );
+
+        manager.end_dynamic_agent(session.id, second).unwrap();
+        let metadata = manager.get(session.id).unwrap().metadata();
+        assert_eq!(metadata.agent_integration, None);
+        assert_eq!(metadata.agent_state, None);
+        manager.get(session.id).unwrap().kill().unwrap();
     }
 
     #[cfg(unix)]

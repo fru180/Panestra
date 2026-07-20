@@ -98,7 +98,9 @@ Select a pane and type directly into it. The active pane supports keyboard and I
 
 ### 4. Use agent state integration
 
-When you launch an integrated Codex CLI or Claude Code session, Panestra reads official lifecycle-hook events to display the agent state. It does not infer state from terminal text, colors, prompts, or ANSI output.
+When you launch an integrated Codex CLI or Claude Code session, Panestra reads official lifecycle-hook events to display the agent state. The same integration is applied automatically when you run `codex` or `claude` from `PATH` inside a regular Terminal session. When that CLI exits, the pane returns to the Terminal state.
+
+Panestra does not infer state from terminal text, colors, prompts, or ANSI output. Absolute executable paths and commands that bypass the session's `PATH` are not intercepted.
 
 Panestra also provides a session-scoped MCP server that lets the agent report a task summary, working directory, and optional Git branch. MCP calls are controlled by the agent, so action details may not be available for every turn and do not affect hook-based state tracking.
 
