@@ -21,6 +21,13 @@ const FLOATS_PER_VERTEX = 9;
 const FONT = '600 32px "SFMono-Semibold", "SF Mono", Menlo, Monaco, monospace';
 const ATLAS_COLUMNS = 32;
 const MAX_ATLAS_GLYPHS = 4096;
+const MAX_ATLAS_ROWS = Math.ceil(MAX_ATLAS_GLYPHS / ATLAS_COLUMNS);
+
+export type GlyphAtlasEntry = readonly [
+  column: number,
+  row: number,
+  columnSpan: number,
+];
 
 export async function requestWebGpuDevice(): Promise<GPUDevice> {
   if (!navigator.gpu) throw new Error("WebGPUを利用できません");
@@ -146,7 +153,7 @@ export class TerminalRenderer {
     const vertices = buildVertices(
       panes,
       atlas.glyphs,
-      atlas.canvas.height / ATLAS_CELL_HEIGHT,
+      atlas.rows,
       this.#canvas.clientWidth,
       this.#canvas.clientHeight,
     );
@@ -208,29 +215,11 @@ export class TerminalRenderer {
 
 function buildAtlas(panes: PaneRenderModel[]): {
   canvas: OffscreenCanvas;
-  glyphs: Map<string, [number, number]>;
+  glyphs: Map<string, GlyphAtlasEntry>;
+  rows: number;
 } {
-  const characters = new Set(" □");
-  for (const pane of panes) {
-    const snapshot = pane.snapshot;
-    if (snapshot?.styledCells?.length) {
-      for (const cell of snapshot.styledCells) {
-        if (characters.size < MAX_ATLAS_GLYPHS && cell[2] && !isEmoji(cell[2]))
-          characters.add(cell[2]);
-      }
-    } else {
-      for (const character of snapshot?.contents ?? "") {
-        if (
-          characters.size < MAX_ATLAS_GLYPHS &&
-          character !== "\n" &&
-          !isEmoji(character)
-        )
-          characters.add(character);
-      }
-    }
-  }
-  const glyphs = new Map<string, [number, number]>();
-  const rows = Math.max(1, Math.ceil(characters.size / ATLAS_COLUMNS));
+  const characters = collectGlyphSpans(panes);
+  const { glyphs, rows } = layoutGlyphAtlas(characters);
   const canvas = new OffscreenCanvas(
     ATLAS_COLUMNS * ATLAS_CELL_WIDTH,
     rows * ATLAS_CELL_HEIGHT,
@@ -240,24 +229,73 @@ function buildAtlas(panes: PaneRenderModel[]): {
   context.font = FONT;
   context.textBaseline = "top";
   context.fillStyle = "white";
-  let index = 0;
-  for (const character of characters) {
-    const x = index % ATLAS_COLUMNS;
-    const y = Math.floor(index / ATLAS_COLUMNS);
-    glyphs.set(character, [x, y]);
+  for (const [character, glyph] of glyphs) {
     context.fillText(
       character,
-      x * ATLAS_CELL_WIDTH,
-      y * ATLAS_CELL_HEIGHT + 4,
+      glyph[0] * ATLAS_CELL_WIDTH,
+      glyph[1] * ATLAS_CELL_HEIGHT + 4,
     );
-    index += 1;
   }
-  return { canvas, glyphs };
+  return { canvas, glyphs, rows };
+}
+
+export function collectGlyphSpans(
+  panes: PaneRenderModel[],
+): Map<string, number> {
+  const characters = new Map<string, number>([
+    [" ", 1],
+    ["□", 1],
+  ]);
+  const addCharacter = (character: string, columnSpan: number): void => {
+    if (!characters.has(character) && characters.size >= MAX_ATLAS_GLYPHS)
+      return;
+    characters.set(
+      character,
+      Math.max(characters.get(character) ?? 1, columnSpan),
+    );
+  };
+  for (const pane of panes) {
+    const snapshot = pane.snapshot;
+    if (snapshot?.styledCells?.length) {
+      for (const cell of snapshot.styledCells) {
+        if (cell[2] && cell[3] !== 0 && !isEmoji(cell[2]))
+          addCharacter(cell[2], cell[3] >= 2 ? 2 : 1);
+      }
+    } else {
+      for (const character of snapshot?.contents ?? "") {
+        if (character !== "\n" && !isEmoji(character))
+          addCharacter(character, isWide(character) ? 2 : 1);
+      }
+    }
+  }
+  return characters;
+}
+
+export function layoutGlyphAtlas(characters: ReadonlyMap<string, number>): {
+  glyphs: Map<string, GlyphAtlasEntry>;
+  rows: number;
+} {
+  const glyphs = new Map<string, GlyphAtlasEntry>();
+  let column = 0;
+  let row = 0;
+
+  for (const [character, rawColumnSpan] of characters) {
+    const columnSpan = rawColumnSpan >= 2 ? 2 : 1;
+    if (column + columnSpan > ATLAS_COLUMNS) {
+      if (row + 1 >= MAX_ATLAS_ROWS) break;
+      column = 0;
+      row += 1;
+    }
+    glyphs.set(character, [column, row, columnSpan]);
+    column += columnSpan;
+  }
+
+  return { glyphs, rows: Math.max(1, row + 1) };
 }
 
 function buildVertices(
   panes: PaneRenderModel[],
-  glyphs: Map<string, [number, number]>,
+  glyphs: Map<string, GlyphAtlasEntry>,
   atlasRows: number,
   canvasWidth: number,
   canvasHeight: number,
@@ -384,7 +422,7 @@ function appendGlyph(
   y: number,
   width: number,
   height: number,
-  glyph: [number, number],
+  glyph: GlyphAtlasEntry,
   atlasRows: number,
   canvasWidth: number,
   canvasHeight: number,
@@ -394,11 +432,7 @@ function appendGlyph(
   const right = ((x + width) / canvasWidth) * 2 - 1;
   const top = 1 - (y / canvasHeight) * 2;
   const bottom = 1 - ((y + height) / canvasHeight) * 2;
-  const atlasWidth = ATLAS_COLUMNS * ATLAS_CELL_WIDTH;
-  const u0 = (glyph[0] * ATLAS_CELL_WIDTH) / atlasWidth;
-  const u1 = ((glyph[0] + 1) * ATLAS_CELL_WIDTH) / atlasWidth;
-  const v0 = glyph[1] / atlasRows;
-  const v1 = (glyph[1] + 1) / atlasRows;
+  const { u0, u1, v0, v1 } = glyphTextureBounds(glyph, atlasRows);
   const vertex = (px: number, py: number, u: number, v: number) =>
     output.push(px, py, u, v, ...color, 0);
   vertex(left, top, u0, v0);
@@ -407,6 +441,19 @@ function appendGlyph(
   vertex(left, top, u0, v0);
   vertex(right, bottom, u1, v1);
   vertex(right, top, u1, v0);
+}
+
+export function glyphTextureBounds(
+  glyph: GlyphAtlasEntry,
+  atlasRows: number,
+): { u0: number; u1: number; v0: number; v1: number } {
+  const atlasWidth = ATLAS_COLUMNS * ATLAS_CELL_WIDTH;
+  return {
+    u0: (glyph[0] * ATLAS_CELL_WIDTH) / atlasWidth,
+    u1: ((glyph[0] + glyph[2]) * ATLAS_CELL_WIDTH) / atlasWidth,
+    v0: glyph[1] / atlasRows,
+    v1: (glyph[1] + 1) / atlasRows,
+  };
 }
 
 function appendSolid(
